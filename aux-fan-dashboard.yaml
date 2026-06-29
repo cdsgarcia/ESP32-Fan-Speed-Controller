@@ -1,0 +1,200 @@
+views:
+  - type: sidebar
+    path: ''
+    cards:
+      - type: custom:apexcharts-card
+        header:
+          title: ''
+          show: true
+          show_states: true
+          colorize_states: true
+        graph_span: 6h
+        apex_config:
+          chart:
+            height: 600px
+          legend:
+            show: false
+        yaxis:
+          - id: speed
+            show: true
+            min: 0
+            max: 100
+            apex_config:
+              tickAmount: 10
+          - id: temp
+            opposite: true
+            show: true
+            apex_config:
+              tickAmount: 10
+        series:
+          - entity: sensor.srne_temperature
+            name: SRNE
+            stroke_width: 2
+            yaxis_id: temp
+            curve: smooth
+          - entity: sensor.srne_ambient_temperature
+            name: Ambient
+            stroke_width: 2
+            yaxis_id: temp
+            curve: smooth
+          - entity: sensor.bluetooth_proxy_668d5c_control_temp
+            name: Control
+            stroke_width: 1
+            yaxis_id: temp
+            curve: smooth
+          - entity: number.bluetooth_proxy_668d5c_target_temp
+            name: Target
+            stroke_width: 2
+            yaxis_id: temp
+            stroke_dash: 5
+          - entity: number.bluetooth_proxy_668d5c_ambient_high_temp
+            name: Ambient High
+            stroke_width: 2
+            stroke_dash: 5
+            yaxis_id: temp
+          - entity: sensor.bluetooth_proxy_668d5c_fan_speed
+            name: PWM
+            stroke_width: 0.5
+            yaxis_id: speed
+            type: area
+            opacity: 0.1
+            curve: straight
+      - type: custom:apexcharts-card
+        header:
+          title: ''
+          show: true
+          show_states: true
+          colorize_states: true
+        graph_span: 6h
+        apex_config:
+          legend:
+            show: false
+          chart:
+            height: 600px
+          dataLabels:
+            enabled: true
+        yaxis:
+          - id: RPM
+            opposite: true
+            show: true
+            min: 0
+            max: 3200
+            apex_config:
+              tickAmount: 5
+        series:
+          - entity: sensor.bluetooth_proxy_668d5c_fan_1_rpm
+            name: Fan 1
+            stroke_width: 1
+            curve: straight
+          - entity: sensor.bluetooth_proxy_668d5c_fan_2_rpm
+            name: Fan 2
+            stroke_width: 1
+            curve: straight
+          - entity: sensor.bluetooth_proxy_668d5c_fan_3_rpm
+            name: Fan 3
+            stroke_width: 1
+            curve: straight
+          - entity: sensor.bluetooth_proxy_668d5c_fan_4_rpm
+            name: Fan 4
+            stroke_width: 1
+            curve: straight
+      - clock_style: digital
+        clock_size: medium
+        time_format: '12'
+        show_seconds: true
+        no_background: true
+        type: clock
+        face_style: markers
+        view_layout:
+          position: sidebar
+      - type: gauge
+        entity: sensor.battery_soc_mean
+        name: BATTERY
+        needle: true
+        max: 100
+        severity:
+          green: 80
+          yellow: 20
+          red: 0
+        view_layout:
+          position: sidebar
+        unit: '%'
+      - type: gauge
+        entity: sensor.pv_power_kw
+        name: PV (kW)
+        needle: true
+        max: 4.96
+        severity:
+          green: 3.6
+          yellow: 0.9
+          red: 0
+        view_layout:
+          position: sidebar
+        visibility:
+          - condition: numeric_state
+            above: 0
+      - type: gauge
+        entity: sensor.total_battery_power_kw
+        name: CHARGING (kW)
+        needle: true
+        max: 4.96
+        severity:
+          green: 3.6
+          yellow: 0.9
+          red: 0
+        view_layout:
+          position: sidebar
+        visibility:
+          - condition: numeric_state
+            above: 0
+      - type: gauge
+        entity: sensor.total_battery_power_absolute_kw
+        name: DISCHARGING (kW)
+        needle: true
+        severity:
+          green: 0
+          yellow: 1
+          red: 3
+        view_layout:
+          position: sidebar
+        visibility:
+          - condition: numeric_state
+            above: 0
+          - condition: not
+            conditions:
+              - condition: numeric_state
+                above: 0
+                entity: sensor.total_battery_power
+        min: 0
+        max: 4
+      - type: gauge
+        entity: sensor.a_c_1f_power_meter_power
+        name: A/C 1F
+        needle: true
+        max: 1500
+        view_layout:
+          position: sidebar
+        severity:
+          green: 500
+          yellow: 700
+          red: 1000
+        visibility:
+          - condition: numeric_state
+            above: 40
+        min: 0
+      - type: gauge
+        entity: sensor.a_c_3f_power_meter_power
+        name: A/C 3F
+        needle: true
+        max: 1200
+        view_layout:
+          position: sidebar
+        severity:
+          green: 0
+          yellow: 50
+          red: 1100
+        min: 0
+        visibility:
+          - condition: numeric_state
+            above: 50
+    title: Aux Fan

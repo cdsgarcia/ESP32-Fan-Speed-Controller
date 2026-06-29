@@ -1,0 +1,19 @@
+# Project instructions — local only, never committed
+.github/*instructions.md
+
+# Credentials and secrets
+secrets.yaml
+*.txt
+*.token
+*.key
+
+# ESPHome build artifacts
+.esphome/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.swp

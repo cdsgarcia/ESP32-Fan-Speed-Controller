@@ -1,0 +1,672 @@
+
+substitutions:
+  name: esp32-bluetooth-proxy-668d5c
+  friendly_name: Bluetooth Proxy 668d5c
+
+# ---------------------------------------------------------------------------
+# on_boot actions (priority: -100, runs after all components are initialised):
+#   1. Start the onboard LED breathing effect
+#   2. Apply the restored current_fan_speed to the PWM hardware
+#      (LEDC always resets to 0% on power-up; without this fans stay off
+#       until the control script detects a speed change)
+#   3. Publish the initial fan speed to HA so Fan Speed is never "unknown"
+# ---------------------------------------------------------------------------
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  on_boot:
+    priority: -100 # Run after all components are initialised
+    then:
+      - light.turn_on:
+          id: onboard_light
+          effect: "Breathing Effect"
+      # Apply the restored fan speed to the PWM hardware immediately on boot.
+      # The LEDC output always resets to 0% on power-up regardless of the
+      # restored global value, so without this fans would stay physically off
+      # until the control script detects a speed change.
+      # Also publish the initial speed to HA so it is never "unknown" after boot.
+      - lambda: |-
+          id(fan_pwm_output).set_level(id(current_fan_speed) / 100.0f);
+          id(fan_speed_sensor).publish_state(id(current_fan_speed));
+
+esp32:
+  variant: esp32
+  framework:
+    type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+      
+# Enable logging
+logger:
+  logs:
+    sensor: WARN          # suppress per-second sensor state logs
+    pulse_counter: WARN   # suppress RPM pulse debug logs
+
+# Enable Home Assistant API
+api:
+
+ota:
+  - platform: esphome
+
+# ── WiFi ──────────────────────────────────────────────────────
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "proxy-668d5c"
+    password: "proxy-668d5c"
+  reboot_timeout: 0s
+
+captive_portal:
+
+esp32_ble_tracker:
+  scan_parameters:
+    # We currently use the defaults to ensure Bluetooth
+    # can co-exist with WiFi In the future we may be able to
+    # enable the built-in coexistence logic in ESP-IDF
+    active: true
+    # interval: 1100ms
+    # window: 1100ms
+
+bluetooth_proxy:
+  active: true
+  connection_slots: 4
+
+esp32_ble:
+  max_connections: 4
+
+
+# ---------------------------------------------------------------------------
+# Fan Control – Global state
+#   current_fan_speed    : last applied PWM duty cycle (%)
+#     restore_value: yes  – persists across reboots (resumes at pre-reboot speed)
+#     initial_value: 100  – on first boot or factory reset, fans start at 100%
+#   ambient_high_latch   : hysteresis latch for the Ambient High Temp safety zone
+#     true  – zone is active; fans stay at 100% until t2 drops below
+#             (Ambient High Temp − Ambient High Hysteresis)
+#     false – normal; zone activates when t2 ≥ Ambient High Temp
+#     restore_value: no   – always starts cleared on reboot (safe default)
+#   NOTE: The LEDC PWM hardware resets to 0% on every power-up regardless of
+#         the restored global. The on_boot lambda above re-applies the saved
+#         value to the hardware so fans spin up immediately after reboot.
+# ---------------------------------------------------------------------------
+
+globals:
+  - id: current_fan_speed
+    type: float
+    restore_value: yes
+    initial_value: '100'
+
+  - id: ambient_high_latch
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+button:
+  - platform: safe_mode
+    id: button_safe_mode
+    name: Safe Mode Boot
+
+  - platform: factory_reset
+    id: factory_reset_btn
+    name: Factory Reset
+
+
+# ---------------------------------------------------------------------------
+# GPIO Pin Map
+#   GPIO2  – Onboard LED (output, LEDC/PWM) – built-in LED on most ESP32 devboards
+#   GPIO25 – Fan PWM Control (output, LEDC 25 kHz) – single wire drives all 4 fans
+#   GPIO26 – Fan 1 Tachometer (input, pulse counter) – RPM feedback, 2 pulses/rev
+#   GPIO27 – Fan 2 Tachometer (input, pulse counter) – RPM feedback, 2 pulses/rev
+#   GPIO32 – Fan 3 Tachometer (input, pulse counter) – RPM feedback, 2 pulses/rev
+#   GPIO33 – Fan 4 Tachometer (input, pulse counter) – RPM feedback, 2 pulses/rev
+#   GPIO35 – Fan 5 Tachometer (input, pulse counter) – RPM feedback, 2 pulses/rev
+# ---------------------------------------------------------------------------
+# Define the onboard LED pin.
+# Note: Pin number varies by board (e.g., GPIO2 for ESP32, D4/GPIO2 for NodeMCU ESP8266)
+
+output:
+  - platform: ledc
+    pin: GPIO2  # Onboard LED – change if your board uses a different pin
+    id: onboard_led_output
+
+  # Fan PWM output – 25 kHz is the standard frequency for 4-wire PWM fans
+  - platform: ledc
+    pin: GPIO25  # Fan PWM signal – connect to the PWM wire (blue) on all 4 fans
+    id: fan_pwm_output
+    frequency: 25000Hz
+
+# Define a light component that uses the output
+light:
+  - platform: monochromatic
+    name: "Onboard Breathing LED"
+    output: onboard_led_output
+    id: onboard_light
+    effects:
+      - pulse:
+          name: "Breathing Effect"
+          transition_length: 1500ms # Time to fade in/out
+          update_interval: 3000ms # Total cycle time (fade in + fade out)
+          min_brightness: 0% # Minimum brightness (prevents a false-off state)
+          max_brightness: 100% # Maximum brightness
+
+
+# ---------------------------------------------------------------------------
+# Fan Control – Configurable parameters exposed to HA as number input boxes
+#
+#   All number inputs:
+#     mode: box          – text-entry box in HA (not a slider)
+#     restore_value: yes – value persists across reboots
+#     initial_value      – applied only on first boot or after Factory Reset
+#
+#   Parameter defaults (initial_value):
+#     Target Temp              : 51.5 °C  (range 45–60,   step 0.1)
+#     Min Speed                : 0 %      (range 0–100,   step 1 ; 1–9% snapped to 0 or 10)
+#     Temp Dead Band           : 0.0 °C   (range 0–2,     step 0.1)
+#     Fan Control Interval     : 1 s      (range 1–5,     step 0.5)
+#     Fan Max Temp             : 1.6 °C   (range 1–5,     step 0.1)
+#     Fan First Step           : 25 %     (range 10–100,  step 1  )
+#     Ambient High Temp        : 55.0 °C  (range 50–60,   step 0.5) – safety override threshold
+#     Ambient High Hysteresis  : 0.5 °C   (range 0–2,     step 0.1) – latch release margin
+# ---------------------------------------------------------------------------
+
+number:
+  - platform: template
+    name: "Target Temp"
+    id: target_temp
+    icon: mdi:thermometer-check
+    unit_of_measurement: "°C"
+    min_value: 45
+    max_value: 60
+    step: 0.1
+    initial_value: 51.5
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Min Speed"
+    id: min_speed
+    icon: mdi:fan-speed-1
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          float v = x;
+          if (v > 0.0f && v < 10.0f) {
+            v = (v >= 5.0f) ? 10.0f : 0.0f;
+          }
+          id(min_speed).publish_state(v);
+
+  - platform: template
+    name: "Temp Dead Band"
+    id: temp_dead_band
+    icon: mdi:delta
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 2.0
+    step: 0.1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Fan Control Interval"
+    id: fan_control_interval
+    icon: mdi:timer-outline
+    unit_of_measurement: "s"
+    min_value: 1
+    max_value: 5
+    step: 0.5
+    initial_value: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Fan Max Temp"
+    id: fan_max_temp
+    icon: mdi:thermometer-alert
+    unit_of_measurement: "°C"
+    min_value: 1
+    max_value: 5
+    step: 0.1
+    initial_value: 1.6
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Fan First Step"
+    id: fan_first_step
+    icon: mdi:fan-speed-1
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 1
+    initial_value: 25
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  # Ambient High Temp – if sensor.srne_ambient_temperature reaches or exceeds
+  # this value the ambient_high_latch is set and fans are forced to 100%.
+  # Latch releases when t2 drops below (Ambient High Temp − Ambient High Hysteresis).
+  # Default: 55.0°C.
+  - platform: template
+    name: "Ambient High Temp"
+    id: ambient_high_temp
+    icon: mdi:thermometer-chevron-up
+    unit_of_measurement: "°C"
+    min_value: 50
+    max_value: 60
+    step: 0.5
+    initial_value: 55.0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  # Ambient High Hysteresis – how far below Ambient High Temp the ambient must
+  # drop before the 100% override is released. Prevents oscillation when ambient
+  # temperature hovers near the threshold. Default: 0.5°C.
+  - platform: template
+    name: "Ambient High Hysteresis"
+    id: ambient_high_hysteresis
+    icon: mdi:thermometer-minus
+    unit_of_measurement: "°C"
+    min_value: 0
+    max_value: 2.0
+    step: 0.1
+    initial_value: 0.5
+    mode: box
+    optimistic: true
+    restore_value: true
+
+
+# ---------------------------------------------------------------------------
+# Fan Control – Temperature source selector
+#   Options : "Both (Higher)" | "SRNE Temperature" (default) | "SRNE Ambient"
+#   restore_value: yes – persists across reboots
+# ---------------------------------------------------------------------------
+
+select:
+  - platform: template
+    name: "Temp Source"
+    id: temp_source
+    icon: mdi:thermometer-lines
+    options:
+      - "Both (Higher)"
+      - "SRNE Temperature"
+      - "SRNE Ambient"
+    initial_option: "SRNE Temperature"
+    optimistic: true
+    restore_value: true
+
+
+# ---------------------------------------------------------------------------
+# Fan Control – Manual override switches (mutually exclusive)
+# ---------------------------------------------------------------------------
+
+switch:
+  - platform: template
+    name: "Max Speed"
+    id: max_speed_switch
+    icon: mdi:fan-speed-3
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - switch.turn_off: fan_off_switch
+
+  - platform: template
+    name: "Fan Off"
+    id: fan_off_switch
+    icon: mdi:fan-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - switch.turn_off: max_speed_switch
+
+sensor:
+  # Optional WiFi Strength Monitor
+  - platform: wifi_signal
+    name: Signal strength
+    update_interval: 60s
+
+  # ---------------------------------------------------------------------------
+  # Temperature sources pulled from Home Assistant
+  #   internal: true  – these are local helpers; they are not re-published to HA
+  # ---------------------------------------------------------------------------
+
+  - platform: homeassistant
+    id: srne_temp
+    entity_id: sensor.srne_temperature
+    internal: true
+
+  - platform: homeassistant
+    id: srne_ambient_temp
+    entity_id: sensor.srne_ambient_temperature
+    internal: true
+
+
+  # ---------------------------------------------------------------------------
+  # Fan RPM sensors via tachometer pulse counter
+  #   Standard 4-wire fans produce 2 pulses per revolution.
+  #   ESPHome pulse_counter reports pulses/min → multiply by 0.5 = RPM.
+  #   update_interval: 5s – RPM display refreshes every 5 seconds.
+  #   RPM in the [I][fan] log line reflects the last 5-second reading;
+  #   it will show 0 during the first 5 s after boot regardless of fan speed.
+  # ---------------------------------------------------------------------------
+
+  - platform: pulse_counter
+    pin: GPIO26  # Fan 1 tachometer – yellow/green tach wire; internal pull-up available
+    name: "Fan 1 RPM"
+    id: fan1_rpm
+    icon: mdi:fan
+    unit_of_measurement: RPM
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO27  # Fan 2 tachometer – yellow/green tach wire; internal pull-up available
+    name: "Fan 2 RPM"
+    id: fan2_rpm
+    icon: mdi:fan
+    unit_of_measurement: RPM
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO32  # Fan 3 tachometer – yellow/green tach wire; internal pull-up available
+    name: "Fan 3 RPM"
+    id: fan3_rpm
+    icon: mdi:fan
+    unit_of_measurement: RPM
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO33  # Fan 4 tachometer – yellow/green tach wire; internal pull-up available
+    name: "Fan 4 RPM"
+    id: fan4_rpm
+    icon: mdi:fan
+    unit_of_measurement: RPM
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO35  # Fan 5 tachometer – yellow/green tach wire; internal pull-up available
+    name: "Fan 5 RPM"
+    id: fan5_rpm
+    icon: mdi:fan
+    unit_of_measurement: RPM
+    accuracy_decimals: 0
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+
+  # ---------------------------------------------------------------------------
+  # Fan control diagnostic sensors
+  # ---------------------------------------------------------------------------
+
+  # Current PWM duty cycle – published on boot and every control cycle.
+  # PWM hardware is only updated when speed actually changes; HA state is
+  # always refreshed so the entity never shows "unknown".
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed_sensor
+    icon: mdi:percent
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+
+
+  # The temperature value actually used for control decisions.
+  # Respects the "Temp Source" selector; returns NaN if selected source is unavailable.
+  # delta: 0.1 filter – only re-publishes to HA when value changes by ≥ 0.1°C.
+  # NOTE: id(control_temp).state used in the log line may lag 1 cycle behind the
+  #       actual monitored_temp computed fresh inside the script each iteration.
+  - platform: template
+    name: "Control Temp"
+    id: control_temp
+    icon: mdi:thermometer
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 1s
+    filters:
+      - delta: 0.1        # only report when value changes by ≥ 0.1°C
+    lambda: |-
+      float t1 = id(srne_temp).state;
+      float t2 = id(srne_ambient_temp).state;
+      bool t1_ok = !isnan(t1);
+      bool t2_ok = !isnan(t2);
+      std::string src = id(temp_source).current_option();
+      if (src == "SRNE Temperature")  return t1_ok ? t1 : NAN;
+      if (src == "SRNE Ambient")      return t2_ok ? t2 : NAN;
+      // "Both (Higher)"
+      if (!t1_ok && !t2_ok) return NAN;
+      if (!t1_ok) return t2;
+      if (!t2_ok) return t1;
+      return (t1 > t2) ? t1 : t2;
+
+
+# ---------------------------------------------------------------------------
+# Fan Control Logic – Proportional Control
+#
+# Control loop: script 'fan_control_runner' (mode: single)
+#   - Runs logic, then delays exactly 'Fan Control Interval' seconds
+#   - 1-second safety-net interval restarts script if it ever stops
+#   - 'script.is_running' check prevents "already running" warnings
+#
+# Temp source: resolved each iteration from 'Temp Source' select
+#   - "SRNE Temperature" → sensor.srne_temperature
+#   - "SRNE Ambient"     → sensor.srne_ambient_temperature
+#   - "Both (Higher)"    → whichever of the two is higher
+#   Failsafe: if selected source(s) unavailable → force 100%
+#
+# Override priority (highest → lowest):
+#   Max Speed switch (100%) > Ambient High Temp zone (100%) > Fan Off switch (0%) > Auto proportional
+#   Switches are mutually exclusive; turning one ON turns the other OFF.
+#   Ambient High Temp override bypasses Fan Off for safety.
+#
+# Zones (in evaluation order):
+#   1. Max Speed switch ON       → 100% (manual override)
+#   2. Ambient High latch (SRNE Ambient ≥ Ambient High Temp, default 55.0°C)
+#                                → 100% (safety override, logged as [W][fan] AMBIENT HIGH)
+#      Latch releases when t2 < (Ambient High Temp − Ambient High Hysteresis, default 0.5°C)
+#      Prevents oscillation when ambient temp hovers near the threshold.
+#   3. Fan Off switch ON         → 0%  (manual override)
+#   4. temp_ok = false           → 100% (failsafe – sensor unavailable)
+#   5. diff ≤ dead_band          → Min Speed (default 0%)
+#   6. 0 < diff ≤ 0.1°C          → Fan First Step (default 25%)
+#   7. diff > 0.1°C              → proportional (Fan First Step → 100%)
+#
+# Proportional formula:
+#   diff = monitored_temp − Target Temp (default 51.5°C)
+#
+#   diff ≤ dead_band             → speed = Min Speed (default 0%)
+#   0 < diff ≤ 0.1°C             → speed = Fan First Step (default 25%)
+#   diff > 0.1°C                 → ratio = (diff − 0.1) / (Fan Max Temp − 0.1)  [clamped 0..1]
+#                                    speed = round(Fan First Step + ratio × (100 − Fan First Step))
+#
+#   Fan Max Temp default: 1.6°C  → 100% fan at Target + 1.6°C (53.1°C)
+#
+# Speed table (Target=51.5°C, Fan Max Temp=1.6°C, Fan First Step=25%, Dead Band=0°C):
+#   NOTE: Dead Band=0°C means diff≤0 → Min Speed (fans off at/below target).
+#         First step (25%) activates at any diff > 0 up to 0.1°C.
+#         Range = 75% over 1.5°C span → exactly +5% per 0.1°C (75 ÷ 15 = 5.000%).
+#   ≤51.5°C (diff≤0)   →  0%   (at/below target)
+#   51.6°C  (0.1°C)    → 25%   ← first step
+#   51.7°C  (0.2°C)    → 30%
+#   51.8°C  (0.3°C)    → 35%
+#   51.9°C  (0.4°C)    → 40%
+#   52.0°C  (0.5°C)    → 45%
+#   52.1°C  (0.6°C)    → 50%
+#   52.2°C  (0.7°C)    → 55%
+#   52.3°C  (0.8°C)    → 60%
+#   52.4°C  (0.9°C)    → 65%
+#   52.5°C  (1.0°C)    → 70%
+#   52.6°C  (1.1°C)    → 75%
+#   52.7°C  (1.2°C)    → 80%
+#   52.8°C  (1.3°C)    → 85%
+#   52.9°C  (1.4°C)    → 90%
+#   53.0°C  (1.5°C)    → 95%
+#   ≥53.1°C (≥1.6°C)   → 100%  (exactly +5% per 0.1°C; 75% ÷ 15 steps = 5.000%)
+#
+# Valid speed values: 0% or 10%–100%  (1–9% not allowed; snapped: <5%→0%, ≥5%→10%)
+# ---------------------------------------------------------------------------
+
+# The script runs the logic then waits fan_control_interval seconds before finishing.
+# The interval (1 s safety net) restarts it if it ever stops.
+
+script:
+  - id: fan_control_runner
+    mode: single           # ignore re-trigger while delay is active
+    then:
+      - lambda: |-
+          float t1 = id(srne_temp).state;
+          float t2 = id(srne_ambient_temp).state;
+          bool t1_ok = !isnan(t1);
+          bool t2_ok = !isnan(t2);
+
+          // Resolve monitored temperature based on selected source
+          std::string src = id(temp_source).current_option();
+          float monitored_temp;
+          bool temp_ok;
+          if (src == "SRNE Temperature") {
+            temp_ok = t1_ok;
+            monitored_temp = t1;
+          } else if (src == "SRNE Ambient") {
+            temp_ok = t2_ok;
+            monitored_temp = t2;
+          } else {
+            // "Both (Higher)" – failsafe if either is unavailable
+            temp_ok = t1_ok && t2_ok;
+            monitored_temp = (t1_ok && t2_ok) ? ((t1 > t2) ? t1 : t2) :
+                             (t1_ok ? t1 : t2);
+          }
+
+          float speed   = id(current_fan_speed);
+          float min_spd = id(min_speed).state;
+
+          if (id(max_speed_switch).state) {
+            // Override: force maximum speed
+            speed = 100.0f;
+
+          } else if ([&]() -> bool {
+            // Ambient High latch with hysteresis
+            float threshold  = id(ambient_high_temp).state;
+            float hysteresis = id(ambient_high_hysteresis).state;
+            if (!isnan(t2)) {
+              if (t2 >= threshold) {
+                id(ambient_high_latch) = true;
+              } else if (t2 < (threshold - hysteresis)) {
+                id(ambient_high_latch) = false;
+              }
+            }
+            return id(ambient_high_latch);
+          }()) {
+            // Safety zone active: hold 100% until ambient drops below (threshold − hysteresis)
+            speed = 100.0f;
+            ESP_LOGW("fan", "AMBIENT HIGH: %.1f°C threshold=%.1f°C hyst=%.1f°C latch=%s – forcing 100%%",
+              t2, id(ambient_high_temp).state, id(ambient_high_hysteresis).state,
+              id(ambient_high_latch) ? "ON" : "OFF");
+
+          } else if (id(fan_off_switch).state) {
+            // Override: force fan off
+            speed = 0.0f;
+
+          } else if (!temp_ok) {
+            // Failsafe: selected source(s) unavailable → full speed
+            speed = 100.0f;
+
+          } else {
+            // Proportional control
+            float target    = id(target_temp).state;
+            float dead_band = id(temp_dead_band).state;
+            float max_diff  = id(fan_max_temp).state;
+            float diff      = monitored_temp - target;
+
+            if (diff <= dead_band) {
+              // Within dead band or below target → ramp down to min
+              speed = min_spd;
+            } else if (diff <= 0.1f) {
+              // First step: any temp above dead band up to 0.1°C → configurable first step speed
+              speed = id(fan_first_step).state;
+            } else {
+              // Above 0.1°C: proportional first_step→100% over remaining range, rounded to nearest whole %
+              float first_step = id(fan_first_step).state;
+              float remaining = max_diff - 0.1f;
+              float ratio = (diff - 0.1f) / remaining;
+              if (ratio > 1.0f) ratio = 1.0f;
+              speed = roundf(first_step + ratio * (100.0f - first_step));
+            }
+
+            // Clamp to [min_spd, 100 %]
+            if (speed > 100.0f) speed = 100.0f;
+            if (speed < min_spd) speed = min_spd;
+
+            // Enforce valid range: skip 1–9 % band
+            if (speed > 0.0f && speed < 10.0f) {
+              speed = (speed >= 5.0f) ? 10.0f : 0.0f;
+            }
+
+            // Re-apply minimum after snap
+            if (speed < min_spd) speed = min_spd;
+          }
+
+          // Only update PWM output if speed actually changed
+          if (speed != id(current_fan_speed)) {
+            id(current_fan_speed) = speed;
+            id(fan_pwm_output).set_level(speed / 100.0f);
+          }
+   
+          // Always publish to HA so the entity never shows "unknown"
+          id(fan_speed_sensor).publish_state(speed);
+
+          // Log control status every interval
+          float target_log = id(target_temp).state;
+          float diff_log   = id(control_temp).state - target_log;
+          ESP_LOGI("fan", "Temp: %.1f°C | Amb: %.1f°C | Target: %.1f°C | Diff: %+.1f°C | PWM: %.0f%% | RPM: F1=%.0f F2=%.0f F3=%.0f F4=%.0f F5=%.0f",
+            id(control_temp).state,
+            id(srne_ambient_temp).state,
+            target_log,
+            diff_log,
+            id(current_fan_speed),
+            id(fan1_rpm).state,
+            id(fan2_rpm).state,
+            id(fan3_rpm).state,
+            id(fan4_rpm).state,
+            id(fan5_rpm).state
+          );
+      # Wait for the configured interval before script completes
+      # (1-second safety net interval will restart it when done)
+      - delay: !lambda 'return (uint32_t)(id(fan_control_interval).state * 1000.0f);'
+
+# 1-second safety net – starts the script only if it is not already running
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            not:
+              script.is_running: fan_control_runner
+          then:
+            - script.execute: fan_control_runner
